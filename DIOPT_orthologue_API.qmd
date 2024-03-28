@@ -1,0 +1,308 @@
+---
+title: "DIOPT API"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+## Objective
+
+Get DIOPT conversion table for Dmel <-> Mmus, Rnor, Hsap using DIOPT api
+
+## Get Dmel entrez ID
+
+N.B. Note that a single Ensembl ID can be mapped to multiple ENTREZ IDs and vice versa
+
+```{r}
+library(biomaRt)
+library(tidyverse)
+
+dmel_t2g_ens99 <- read_csv("./data/GENOMEDIR/Dmel_tx2gene_ENSEMBL_v99.csv")
+dmel_ens99_genes <- unique(dmel_t2g_ens99$gene_id)
+
+fly_mart99 <- useMart(biomart = "ENSEMBL_MART_ENSEMBL", dataset = "dmelanogaster_gene_ensembl", 
+                      host = "https://jan2020.archive.ensembl.org")
+fly_biomart_attributes <- listAttributes(fly_mart99)
+attributes_wanted <- c("ensembl_gene_id", "entrezgene_id")
+
+ens99_entrez <- getBM(
+  attributes = attributes_wanted,
+  mart = fly_mart99,
+  filters = "ensembl_gene_id",
+  values = dmel_ens99_genes
+)
+
+ens99_entrez_filtered <- ens99_entrez %>%
+  group_by(ensembl_gene_id) %>%
+  slice_min(entrezgene_id)
+
+write_csv(ens99_entrez_filtered, "./data/GENOMEDIR/Dmel_entrezid_ENSEMBL_v99.csv")
+
+```
+
+## Make DIOPT API requests 
+
+### Prepare API access
+
+```{r}
+library(httr)
+library(jsonlite)
+library(furrr)
+plan(multisession, workers = 12)
+
+dmel_entrez_list <- ens99_entrez %>%
+  filter(!is.na(entrezgene_id)) %>%
+  pull() %>%
+  as.list() %>%
+  set_names(~ as.character(.x))
+
+dmel_ens99_entrez <- ens99_entrez %>%
+  setNames(c("dmel_ensembl_id", "dmel_entrezid")) %>%
+  mutate(across(everything(), as.character))
+
+dmel_taxid <- "7227"
+hsap_taxid <- "9606"
+mmus_taxid <- "10090"
+rnor_taxid <- "10116"
+
+api_version <- "v9"
+filter_option <- "exclude_score_less_2"
+
+```
+
+### Hsap
+
+```{r}
+dmel_to_hsap_api_scrap <- dmel_entrez_list %>%
+  future_map(~{
+    res <- GET(paste0(
+      "https://www.flyrnai.org/tools/diopt/web/diopt_api/",
+      api_version, 
+      "/get_orthologs_from_entrez/",
+      dmel_taxid, "/",
+      .x, "/",
+      hsap_taxid, "/",
+      filter_option
+    ))
+    
+    data <- fromJSON(rawToChar(res$content))
+    
+    if(length(data$results) == 0){
+      output <- list()
+    } else {
+      output <- do.call(rbind, pluck(data$results, as.character(.x))) %>%
+        as.data.frame() %>%
+        rownames_to_column(var = "target_entrezid") %>%
+        as_tibble() %>%
+        mutate(across(everything(), as.character))
+    }
+    
+    return(output)
+  })
+
+dmel_to_hsap <- dmel_to_hsap_api_scrap %>%
+  purrr::keep(~ is_tibble(.x) == TRUE) %>%
+  map_dfr(~ .x, .id = "dmel_entrezid") %>%
+  left_join(dmel_ens99_entrez) %>%
+  left_join(
+    dmel_t2g_ens99 %>%
+      dplyr::select("dmel_ensembl_id" = gene_id, "dmel_gene_name" = gene_name) %>%
+      distinct()
+  )
+
+hsap_mart99 <- useMart(biomart = "ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl", 
+                      host = "https://jan2020.archive.ensembl.org")
+hsap_biomart_attributes <- listAttributes(hsap_mart99)
+hsap_entrez <- getBM(
+  attributes = c("entrezgene_id", "ensembl_gene_id", "external_gene_name"),
+  mart = hsap_mart99,
+  filters = "entrezgene_id",
+  values = unique(dmel_to_hsap$target_entrezid)
+)
+
+dmel_to_hsap_diopt <- dmel_to_hsap %>%
+  left_join(
+    hsap_entrez %>%
+      setNames(c("target_entrezid", "hsap_ensembl_id", "hsap_gene_name")) %>%
+      mutate(across(everything(), as.character))
+  ) %>%
+  dplyr::select(dmel_ensembl_id, dmel_gene_name, hsap_ensembl_id, hsap_gene_name, "diopt_score" = score, best_score_rev, confidence) %>%
+  mutate(diopt_score = as.double(diopt_score))
+
+write_csv(dmel_to_hsap_diopt, "./data/DIOPT/dmel_to_hsap_diopt_full.csv")
+
+dmel_to_hsap_diopt %>%
+  ggplot(aes(x = diopt_score)) +
+  geom_histogram(binwidth = 1)
+
+dmel_to_hsap_diopt %>%
+  filter(diopt_score >= 8) %>%
+  pull(dmel_ensembl_id) %>% unique() %>% length()
+
+```
+
+### Mmus
+
+```{r}
+dmel_to_mmus_api_scrap <- dmel_entrez_list %>%
+  future_map(~{
+    res <- GET(paste0(
+      "https://www.flyrnai.org/tools/diopt/web/diopt_api/",
+      api_version, 
+      "/get_orthologs_from_entrez/",
+      dmel_taxid, "/",
+      .x, "/",
+      mmus_taxid, "/",
+      filter_option
+    ))
+    
+    data <- fromJSON(rawToChar(res$content))
+    
+    if(length(data$results) == 0){
+      output <- list()
+    } else {
+      output <- do.call(rbind, pluck(data$results, as.character(.x))) %>%
+        as.data.frame() %>%
+        rownames_to_column(var = "target_entrezid") %>%
+        as_tibble() %>%
+        mutate(across(everything(), as.character))
+    }
+    
+    return(output)
+  })
+
+dmel_to_mmus <- dmel_to_mmus_api_scrap %>%
+  purrr::keep(~ is_tibble(.x) == TRUE) %>%
+  map_dfr(~ .x, .id = "dmel_entrezid") %>%
+  left_join(dmel_ens99_entrez) %>%
+  left_join(
+    dmel_t2g_ens99 %>%
+      dplyr::select("dmel_ensembl_id" = gene_id, "dmel_gene_name" = gene_name) %>%
+      distinct()
+  )
+
+mmus_mart99 <- useMart(biomart = "ENSEMBL_MART_ENSEMBL", dataset = "mmusculus_gene_ensembl", 
+                      host = "https://jan2020.archive.ensembl.org")
+mmus_biomart_attributes <- listAttributes(mmus_mart99)
+mmus_entrez <- getBM(
+  attributes = c("entrezgene_id", "ensembl_gene_id", "external_gene_name"),
+  mart = mmus_mart99,
+  filters = "entrezgene_id",
+  values = unique(dmel_to_mmus$target_entrezid)
+)
+
+dmel_to_mmus_diopt <- dmel_to_mmus %>%
+  left_join(
+    mmus_entrez %>%
+      setNames(c("target_entrezid", "mmus_ensembl_id", "mmus_gene_name")) %>%
+      mutate(across(everything(), as.character))
+  ) %>%
+  dplyr::select(dmel_ensembl_id, dmel_gene_name, mmus_ensembl_id, mmus_gene_name, "diopt_score" = score, best_score_rev, confidence) %>%
+  mutate(diopt_score = as.double(diopt_score))
+
+write_csv(dmel_to_mmus_diopt, "./data/DIOPT/dmel_to_mmus_diopt_full.csv")
+
+dmel_to_mmus_diopt %>%
+  ggplot(aes(x = diopt_score)) +
+  geom_histogram(binwidth = 1)
+
+dmel_to_mmus_diopt %>%
+  filter(diopt_score >= 8) %>%
+  pull(dmel_ensembl_id) %>% unique() %>% length()
+
+```
+
+### Rnor
+
+```{r}
+dmel_to_rnor_api_scrap <- dmel_entrez_list %>%
+  future_map(~{
+    res <- GET(paste0(
+      "https://www.flyrnai.org/tools/diopt/web/diopt_api/",
+      api_version, 
+      "/get_orthologs_from_entrez/",
+      dmel_taxid, "/",
+      .x, "/",
+      rnor_taxid, "/",
+      filter_option
+    ))
+    
+    data <- fromJSON(rawToChar(res$content))
+    
+    if(length(data$results) == 0){
+      output <- list()
+    } else {
+      output <- do.call(rbind, pluck(data$results, as.character(.x))) %>%
+        as.data.frame() %>%
+        rownames_to_column(var = "target_entrezid") %>%
+        as_tibble() %>%
+        mutate(across(everything(), as.character))
+    }
+    
+    return(output)
+  })
+
+dmel_to_rnor <- dmel_to_rnor_api_scrap %>%
+  purrr::keep(~ is_tibble(.x) == TRUE) %>%
+  map_dfr(~ .x, .id = "dmel_entrezid") %>%
+  left_join(dmel_ens99_entrez) %>%
+  left_join(
+    dmel_t2g_ens99 %>%
+      dplyr::select("dmel_ensembl_id" = gene_id, "dmel_gene_name" = gene_name) %>%
+      distinct()
+  )
+
+rnor_mart99 <- useMart(biomart = "ENSEMBL_MART_ENSEMBL", dataset = "rnorvegicus_gene_ensembl", 
+                      host = "https://jan2020.archive.ensembl.org")
+rnor_biomart_attributes <- listAttributes(rnor_mart99)
+rnor_entrez <- getBM(
+  attributes = c("entrezgene_id", "ensembl_gene_id", "external_gene_name"),
+  mart = rnor_mart99,
+  filters = "entrezgene_id",
+  values = unique(dmel_to_rnor$target_entrezid)
+)
+
+dmel_to_rnor_diopt <- dmel_to_rnor %>%
+  left_join(
+    rnor_entrez %>%
+      setNames(c("target_entrezid", "rnor_ensembl_id", "rnor_gene_name")) %>%
+      mutate(across(everything(), as.character))
+  ) %>%
+  dplyr::select(dmel_ensembl_id, dmel_gene_name, rnor_ensembl_id, rnor_gene_name, "diopt_score" = score, best_score_rev, confidence) %>%
+  mutate(diopt_score = as.double(diopt_score))
+
+write_csv(dmel_to_rnor_diopt, "./data/DIOPT/dmel_to_rnor_diopt_full.csv")
+
+dmel_to_rnor_diopt %>%
+  ggplot(aes(x = diopt_score)) +
+  geom_histogram(binwidth = 1)
+
+dmel_to_rnor_diopt %>%
+  filter(diopt_score >= 8) %>%
+  pull(dmel_ensembl_id) %>% unique() %>% length()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
