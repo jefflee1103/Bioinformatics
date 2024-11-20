@@ -1,0 +1,217 @@
+---
+title: "Oligo pool price"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+## Compare Oligo pool pricing model
+
+```{r}
+library(tidyverse)
+library(furrr)
+plan(multisession, workers = 12)
+
+```
+
+### IDT
+
+```{r}
+##
+idt_pricing <- tibble(
+  base_upto = c(3300, 50000, 100000, 10000000000000000000000000),
+  price_per_base = c(95/3300, 0.0357, 0.0242, 0.0116)
+) %>%
+  mutate(interval = row_number())
+
+idt_pricing_interval_list <- idt_pricing$interval %>%
+  imap(~{
+    idt_pricing %>%
+      filter(interval == .x) %>%
+      pull(price_per_base)
+  })
+
+## IDT pricing function
+get_idt_price <- function(oligo_length, pool_size){
+  total_bases <- oligo_length * pool_size 
+  price_interval <- findInterval(total_bases, idt_pricing$base_upto) + 1
+  
+  if(price_interval == 1) {
+    final_price <- 95
+  } else {
+    final_price <- total_bases * idt_pricing_interval_list[[price_interval]]
+  }
+  
+  return(final_price)
+}
+
+## Example usage
+get_idt_price(76, 8000000)
+
+```
+
+### Genscript
+
+```{r}
+##
+gs_pricing_1 <- read_csv("./data/Oligopool/Genscript_pricing_1.csv") %>%
+  pivot_longer(cols = contains(".00"), names_to = "length_upto", values_to = "price") %>%
+  mutate(across(everything(), as.numeric))
+gs_pricing_2 <- read_csv("./data/Oligopool/Genscript_pricing_2.csv") %>%
+  pivot_longer(cols = contains(".00"), names_to = "length_upto", values_to = "price") %>%
+  mutate(across(everything(), as.numeric)) %>%
+  filter(!is.na(oligo))
+
+gs_pricing <- bind_rows(gs_pricing_1, gs_pricing_2) %>%
+  dplyr::rename("pool_count" = oligo) %>%
+  arrange(pool_count)
+
+gs_pool_intervals <- unique(gs_pricing$pool_count)
+
+gs_pricing_withintervals <- gs_pricing %>%
+  mutate(pool_interval = findInterval(pool_count, gs_pool_intervals)) 
+
+## Genscript pricing function
+get_gs_price <- function(oligo_length, pool_size){
+  gs_pricing %>%
+  filter(
+    pool_count >= pool_size
+  ) %>%
+  slice_min(pool_count) %>%
+  filter(
+    length_upto >= oligo_length
+  ) %>%
+  slice_min(length_upto) %>%
+  pull(price)
+}
+
+## Example usage
+get_gs_price(76, 8000000)
+
+```
+
+### Pricing comparison
+
+```{r}
+## HT smFISH style 
+## FLAPX - Hyb - FLAPY = 90bp
+## BC1 (25) + BC2 (25) = 50bp
+## 50-100 oligos per gene
+
+library(patchwork)
+
+## - - - - - 90 nt, 30 oligos per gene = 2700nt per gene
+gene_count <- 1:1000
+
+df1 <- gene_count %>%
+  set_names() %>%
+  future_map_dfr(~{
+    oligo_length <- 90
+    pool_size <- 30 * .x
+    output <- tibble(
+      company = c("IDT", "Genscript"),
+      price = c(get_idt_price(oligo_length, pool_size), get_gs_price(oligo_length, pool_size))
+    )
+  }, .id = "genes_targeted") %>%
+  mutate(genes_targeted = as.numeric(genes_targeted))
+
+df1 %>%
+  ggplot(aes(x = genes_targeted, y = price, colour = company)) + 
+  geom_point(stroke = 0, size = 1) +
+  geom_line(aes(group = company)) + 
+  scale_y_continuous(labels = scales::unit_format(unit = "K", scale = 1e-3)) + 
+  labs(
+    title = "Oligo pool price comparison (HT-smFISH style)",
+    subtitle = "34nt (Hyb) + 56nt (2xFLAPs) = 90 nt, 30 oligos per gene",
+    x = "Number of genes targeted",
+    y = "Price (£)",
+    colour = ""
+  ) + 
+  theme_bw() + 
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = c(0.15, 0.8),
+    legend.background = element_rect(fill = NA)) -> p1
+
+
+## HCR style
+## 45nt + 20nt (T7 promoter) -->  65 times two per gene = 130 nt
+
+## - - - - - 65 nt TIMES 2, 10 PAIRS per gene = 1300nt per gene
+gene_count <- 1:1000
+
+df2 <- gene_count %>%
+  set_names() %>%
+  future_map_dfr(~{
+    oligo_length <- 65
+    pool_size <- 10 * .x * 2
+    output <- tibble(
+      company = c("IDT", "Genscript"),
+      price = c(get_idt_price(oligo_length, pool_size), get_gs_price(oligo_length, pool_size))
+    )
+  }, .id = "genes_targeted") %>%
+  mutate(genes_targeted = as.numeric(genes_targeted))
+
+df2 %>%
+  ggplot(aes(x = genes_targeted, y = price, colour = company)) + 
+  geom_point(stroke = 0, size = 1) +
+  geom_line(aes(group = company)) + 
+  scale_y_continuous(labels = scales::unit_format(unit = "K", scale = 1e-3)) + 
+  labs(
+    title = "Oligo pool price comparison (HCR style)",
+    subtitle = "(25nt (Hyb) + 20nt (B#) + 20nt (T7)) x 2 = 130 nt, 10 pairs per gene",
+    x = "Number of genes targeted",
+    y = "Price (£)",
+    colour = ""
+  ) + 
+  theme_bw() + 
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = c(0.15, 0.8),
+    legend.background = element_rect(fill = NA)) -> p2
+
+
+
+p1/p2
+
+ggsave("~/Desktop/Oligo_pool_price_comparison_full_corrected.png", 
+       width = 6, height = 7)
+
+
+(p1 + coord_cartesian(xlim = c(0, 150), ylim = c(0, 8000))) /
+(p2 + coord_cartesian(xlim = c(0, 150), ylim = c(0, 5000)))
+
+ggsave("~/Desktop/Oligo_pool_price_comparison_zoom_to_150_corrected.png", 
+       width = 6, height = 7)
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

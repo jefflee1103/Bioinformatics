@@ -1,0 +1,106 @@
+---
+title: "Untitled"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+## Vero E6
+ - Chlorocebus sabaeus
+ - ENSCSAP00000007724
+ - ENSCSAG00000011644
+ - 25 molecules per cell
+
+```{r}
+library(tidyverse)
+library(valr)
+
+##
+vero_counts <- list.files("./data/etc/", pattern = "*.sf", full.names = TRUE) %>%
+  set_names() %>%
+  imap(~{
+    read_tsv(.x) %>%
+      dplyr::select("transcript_id" = Name, !!.y := TPM)
+    }) %>%
+  purrr::reduce(left_join) %>%
+  pivot_longer(contains("salmon"), names_to = "library", values_to = "TPM") %>%
+  group_by(transcript_id) %>%
+  summarise(avg_TPM = mean(TPM)) %>%
+  ungroup() %>%
+  mutate(transcript_id = str_remove(transcript_id, "\\.[:digit:]+")) %>%
+  filter(avg_TPM > 0)
+
+gtf <- read_gtf("~/Downloads/Chlorocebus_sabaeus.ChlSab1.1.111.gtf")
+
+tx2gene <- gtf %>%
+  dplyr::select(gene_id, transcript_id) %>%
+  distinct()
+
+vero_counts_gene <- vero_counts %>%
+  left_join(tx2gene)
+
+##
+polr2a_smfish_count <- 50
+resolve_limit <- 200000
+
+vero_scaler <- polr2a_smfish_count / (vero_counts_gene %>%
+  filter(gene_id == "ENSCSAG00000011644") %>%
+  pull(avg_TPM))
+
+vero_abs_counts <- vero_counts_gene %>%
+  mutate(molecule_count = avg_TPM * vero_scaler) %>%
+  mutate(colouring = if_else(gene_id == "ENSCSAG00000011644", "Polr2a", "other")) %>%
+  arrange(desc(molecule_count)) %>%
+  mutate(expression_rank = row_number()) %>%
+  mutate(expression_top_percentile = expression_rank / nrow(vero_counts_gene) * 100) %>%
+  arrange(molecule_count) %>%
+  mutate(molecule_count_cumsum = cumsum(molecule_count)) %>%
+  mutate(channels_required = floor(molecule_count_cumsum / resolve_limit) + 1)
+
+## 
+vero_abs_counts$molecule_count %>% sum()
+
+##
+vero_abs_counts %>%
+  arrange(desc(colouring)) %>%
+  ggplot(aes(x = "Gene", y = molecule_count, colour = colouring, size = colouring)) + 
+  geom_jitter(width = 0.5, stroke = 0, alpha = 0.8) +
+  scale_colour_manual(values = c("gray90", "coral")) + 
+  scale_y_log10(labels = scales::comma) +
+  theme_bw() 
+
+vero_abs_counts %>%
+  ggplot(aes(x = rev(expression_rank), y = channels_required)) + 
+  geom_point(size = 0.5, stroke = 0, alpha = 0.5) +
+  labs(x = "Number of genes (least to highest expression)") + 
+  theme_bw()
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

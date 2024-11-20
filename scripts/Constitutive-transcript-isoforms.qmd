@@ -1,0 +1,476 @@
+---
+title: "Constitutive-transcript-isoforms"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+# Objective
+
+* Get constitutive coordinates of Dmel transcript isoforms that will be used for genome-wide probe design.
+* Use bedtools type approach on GTF file. 
+
+# To do
+
+* How to deal with overlapping genes on the same strand?
+
+# Environment
+
+```{r}
+library(tidyverse)
+library(valr)
+library(furrr)
+library(qs)
+plan(multisession, workers = 8)
+
+```
+
+# GTF processing
+
+## Get GTF and prepare an annotated list per protein-coding and non-coding genes
+
+ENSEMBL GTF is 1-based (use default read_gtf() option to conver automatically to 0-based coordinates)
+
+```{r}
+## import gtf
+gtf <- read_gtf("~/Documents/Data/GENOMEDIR/Dmel/Drosophila_melanogaster.BDGP6.28.99.chr.gtf")
+
+## filter for protein coding and ncRNA
+gtf_pcnc <- gtf %>% 
+  filter(gene_biotype %in% c("protein_coding", "ncRNA"))
+
+## how many genes have both +/- strand attributes? - FBgn0002781 mod(mdg4) is the only one. Ignore this outlier exon. 
+strand_test_df <- gtf_pcnc %>%
+  filter(type == "exon") %>%
+  group_by(gene_id) %>%
+  summarise(strand = unique(strand) %>% sort() %>% paste0(collapse = ""))
+
+gtf_pcnc <- gtf_pcnc %>%
+  filter(!(gene_id == "FBgn0002781" & strand == "+"))
+
+## create a list for each gene
+pcnc_list <- gtf_pcnc %>%
+  split(gtf_pcnc$gene_id)
+
+## create a filtered list of exons
+pcnc_exon_list <- pcnc_list %>%
+  future_imap(~{
+    exon_intervals <- .x %>% filter(type == "exon")
+    isoform_count <- unique(exon_intervals$transcript_id) %>% length()
+    strand <- unique(exon_intervals$strand) %>% unique()
+    
+    output <- list(
+      gene_id = .y,
+      gene_name = unique(exon_intervals$gene_name),
+      gene_biotype = unique(exon_intervals$gene_biotype),
+      exon_intervals = exon_intervals,
+      isoform_count = isoform_count,
+      strand = strand
+    )
+    
+    return(output)
+  }, .progress = TRUE)
+
+## save the list as RDS
+saveRDS(pcnc_exon_list, "./data/constitute-isoforms/ENSEMBL99_proteincoding_noncoding_exon_list.RDS") 
+
+## distribution of transcript isoform count per gene
+isoform_count_df <- pcnc_exon_list %>%
+  future_imap_dfr(~{
+    tibble(
+      gene_name = pluck(.x, "gene_name"),
+      gene_biotype = pluck(.x, "gene_biotype"),
+      isoform_count = pluck(.x, "isoform_count")
+      )
+  }, .id = "gene_id")
+
+isoform_count_df %>%
+  ggplot(aes(x = isoform_count)) + 
+  geom_histogram() + 
+  facet_wrap(~ gene_biotype) + 
+  theme_bw()
+
+```
+
+# Get Multi-intersecting regions
+
+## Set up environment for bedtools
+
+My conda env has bedtools 2.31.1, whereas bedtoolsr is built for 2.30.0 - just in case there are syntax errors...
+
+```{r}
+library(bedtoolsr)
+
+conda_bedtools_bin <- "/opt/miniconda3/envs/bedtools/bin" # find this directory
+Sys.setenv(PATH = paste(Sys.getenv("PATH"), conda_bedtools_bin, sep = .Platform$path.sep))
+Sys.getenv("PATH")
+Sys.which("bedtools")
+
+```
+
+## Find multi-intersecting regions 
+
+```{r}
+##
+pcnc_exon_list <- readRDS("./data/constitute-isoforms/ENSEMBL99_proteincoding_noncoding_exon_list.RDS") 
+
+## find constitutive regions and create a list
+pcnc_constitutive_list <- pcnc_exon_list %>%
+  map(~{
+    if(.x$isoform_count > 1){
+      ## multiinter output
+      multiinter_output <- pluck(.x, "exon_intervals") %>%
+        split(.$transcript_id) %>%
+        map(valr::bed_sort) %>%
+        bedtoolsr::bt.multiinter(header = TRUE, names = paste(names(.), collapse = " ")) %>% 
+        as_tibble() %>%
+        janitor::row_to_names(row_number = 1) %>%
+        mutate(across(c(start, end, num), as.numeric)) %>%
+        mutate(strand = pluck(.x, "strand")) %>%
+        mutate(width = end - start) %>%
+        dplyr::select(chrom, start, end, width, strand, everything())
+      
+      .x$multiinter_output <- multiinter_output
+      
+      ## constitutive intervals
+      constitutive_intervals <- multiinter_output %>%
+        filter(num == pluck(.x, "isoform_count")) %>%
+        dplyr::select(chrom, start, end, width, strand)
+      
+      .x$constitutive_intervals <- constitutive_intervals
+      
+      ## does constitutive intervals exist
+      .x$constitutive_exist <- ifelse(nrow(constitutive_intervals) > 0, TRUE, FALSE)
+      
+      ## length of constitutive intervals
+      .x$constitutive_length <- ifelse(
+        nrow(constitutive_intervals) == 0,
+        0,
+        sum(constitutive_intervals$width)
+      )
+      
+      return(.x)
+      
+    } else if(.x$isoform_count == 1){
+      .x$multiinter_output <- pluck(.x, "exon_intervals") %>%
+        mutate(num = 1) %>%
+        dplyr::select(chrom, start, end, width, strand, num, "list" = transcript_id)
+      
+      .x$constitutive_intervals <- pluck(.x, "exon_intervals") %>%
+        dplyr::select(chrom, start, end, width, strand)
+      
+      .x$constitutive_exist <- TRUE
+      
+      .x$constitutive_length <- pluck(.x, "exon_intervals") %>%
+        pull(width) %>% sum()
+      
+      return(.x)
+      
+    }
+  }, .progress = TRUE)
+
+## save as RDS
+saveRDS(pcnc_constitutive_list, "./data/constitute-isoforms/ENSEMBL99_proteincoding_noncoding_constitutive_list.RDS")
+
+```
+
+## Plotting transcript architecture
+
+```{r}
+## helper function
+plot_isoforms <- function(list_element){
+  list_element$exon_intervals %>% ggplot() +
+      geom_segment(
+        aes(x = min(list_element$exon_intervals$start), 
+            xend = max(list_element$exon_intervals$end), 
+            y = transcript_id, 
+            yend = transcript_id),
+        linewidth = 0.5, colour = "gray80"
+      ) +
+      geom_segment(
+        data = list_element$exon_intervals,
+        aes(x = start, xend = end, y = transcript_id, yend = transcript_id),
+        linewidth = 3, colour = "gray30",
+        inherit.aes = FALSE
+      ) +
+      geom_segment(
+        data = list_element$constitutive_intervals, 
+        aes(x = start, xend = end, y = "CONSTITUTIVE", yend = "CONSTITUTIVE"),
+        linewidth = 7, colour = "coral", 
+        inherit.aes = FALSE
+      ) + 
+      labs(
+        title = paste0(
+          list_element$gene_id, " ", 
+          list_element$gene_name, " ", 
+          list_element$strand, "ve strand ",
+          paste0("(constitutive ", list_element$constitutive_length, "nt)")
+        ),
+        x = "Chromosomal coordinate",
+        y = "Transcript ID"
+      ) + 
+      theme_bw()
+}
+
+## Explore some plots
+library(patchwork)
+
+pcnc_constitutive_list %>%
+  purrr::keep(~ .x$gene_name %in% c("pros", "Syp", "Imp", "jim")) %>%
+  future_map(plot_isoforms) %>%
+  wrap_plots()
+
+ggsave("./data/constitute-isoforms/constitutive_txplot-example.pdf", width = 12, height = 11)
+
+```
+
+## Summary of isoform constitutive mappings
+
+```{r}
+pcnc_constitutive_summary_df <- pcnc_constitutive_list %>%
+  imap_dfr(~{
+    tibble(
+      gene_id = .x$gene_id,
+      gene_name = .x$gene_name,
+      gene_biotype = .x$gene_biotype,
+      constitutive_exist = .x$constitutive_exist,
+      constitutive_length = .x$constitutive_length
+    )
+  }, .progress = TRUE) %>%
+  mutate(constitutive_exist_over_1k = if_else(constitutive_length > 1000, TRUE, FALSE))
+
+pcnc_constitutive_summary_df %>%
+  ggplot(aes(x = gene_biotype, fill = constitutive_exist_over_1k)) +
+  geom_bar(position = position_stack()) + 
+  geom_text(stat = "count", aes(label = after_stat(count)), position = position_stack(), vjust = -0.5) + 
+  labs("Constitutive sequence over 1kb exist?") + 
+  theme_bw() 
+
+ggsave("./data/constitute-isoforms/constitutive_gene-count-constitutive-over-1kb.pdf")
+
+pcnc_constitutive_summary_df %>%
+  ggplot(aes(x = constitutive_length)) +
+  geom_histogram() + 
+  scale_x_log10() +
+  facet_wrap(~ constitutive_exist + gene_biotype) +
+  labs(title = "Have constitutive sequence?") + 
+  theme_bw()
+
+ggsave("./data/constitute-isoforms/constitutive_gene-count-constitutive-length.pdf")
+
+pcnc_constitutive_summary_df %>% summary()
+
+```
+
+# Get target sequences of constitutive intervals
+
+## Get FASTA sequence using bedtools
+
+```{r}
+## constitutive list
+pcnc_constitutive_list <- readRDS("./data/constitute-isoforms/ENSEMBL99_proteincoding_noncoding_constitutive_list.RDS")
+
+# bed_example <- pcnc_constitutive_list$"FBgn0025790"$constitutive_intervals %>%
+#   dplyr::mutate(name = str_c(chrom, start, end, strand, sep = ":")) %>%
+#   dplyr::select(chrom, start, end, name, "score" = width, strand)
+
+# bt.getfasta(
+#   fi = "~/Documents/Data/GENOMEDIR/Dmel/Drosophila_melanogaster.BDGP6.28.dna.toplevel.fa",
+#   bed = pcnc_constitutive_list$"FBgn0025790"$constitutive_intervals,
+#   bedOut = TRUE,
+#   s = NULL
+# )
+
+# bt.getfasta(
+#   fi = "~/Documents/Data/GENOMEDIR/Dmel/Drosophila_melanogaster.BDGP6.28.dna.toplevel.fa",
+#   bed = bed_example,
+#   bedOut = TRUE,
+#   s = TRUE
+# )
+
+pcnc_constitutive_list[[312]]
+
+## get fasta sequence, arrange order depending on the strand, and add character counts with "N"
+pcnc_constitutive_list <- pcnc_constitutive_list %>%
+  map(~ {
+    if (.x$constitutive_exist == TRUE) {
+      bed_touse <- .x$constitutive_intervals %>%
+        dplyr::mutate(name = str_c(chrom, start, end, strand, sep = ":")) %>%
+        dplyr::select(chrom, start, end, name, "score" = width, strand)
+
+      getfasta_output <- bedtoolsr::bt.getfasta(
+        fi = "~/Documents/Data/GENOMEDIR/Dmel/Drosophila_melanogaster.BDGP6.28.dna.toplevel.fa",
+        bed = bed_touse,
+        bedOut = TRUE,
+        s = TRUE
+      ) %>%
+        as_tibble() %>%
+        setNames(c("chrom", "start", "end", "name", "width", "strand", "seq")) %>%
+        dplyr::select(-name) %>%
+        dplyr::arrange(if (.x$strand == "+") start else desc(start)) %>%
+        mutate(nchar_plus_N_cumsum = cumsum(width + 1))
+
+      .x$constitutive_sequence_df <- getfasta_output
+      return(.x)
+    } else {
+      .x$constitutive_sequence_df <- tibble(
+        chrom = character(),
+        start = numeric(),
+        end = numeric(),
+        width = numeric(),
+        strand = character(),
+        seq = character(),
+        nchar_plus_N_cumsum = numeric()
+      )
+      return(.x)
+    }
+  }, .progress = TRUE)
+
+## get concatenated target sequence collapsed for "N"
+pcnc_constitutive_list <- pcnc_constitutive_list %>%
+  map(~ {
+    if (.x$constitutive_exist == TRUE) {
+      constitutive_seq_Ncollapsed <- .x$constitutive_sequence_df %>%
+        pull(seq) %>%
+        paste0(collapse = "N")
+      .x$constitutive_seq_Ncollapsed <- constitutive_seq_Ncollapsed
+      return(.x)
+    } else {
+      .x$constitutive_seq_Ncollapsed <- NULL
+      return(.x)
+    }
+  }, .progress = TRUE)
+
+## save RDS
+pcnc_constitutive_list %>% saveRDS("./data/constitute-isoforms/ENSEMBL99_proteincoding_noncoding_constitutive_list_with_sequence.RDS")
+
+## make a table for non-R users
+output_df <- pcnc_constitutive_list %>%
+  future_imap_dfr(~ {
+    tibble(
+      gene_id = .y,
+      gene_name = .x$gene_name,
+      strand = .x$strand,
+      isoform_count = .x$isoform_count,
+      constitutive_exist = .x$constitutive_exist,
+      constitutive_length = .x$constitutive_length,
+      constitutive_seq_Ncollapsed = ifelse(is.null(.x$constitutive_seq_Ncollapsed), "NA", as.character(.x$constitutive_seq_Ncollapsed)),
+    )
+  })
+
+write_csv(output_df, "./data/constitute-isoforms/ENSEMBL99_proteincoding_noncoding_constitutive_RNA_sequences.csv")
+
+```
+
+## Subsection - get constitutive sequence fasta of a gene 
+
+```{r}
+pcnc_constitutive_list <- readRDS("./data/constitute-isoforms/ENSEMBL99_proteincoding_noncoding_constitutive_list_with_sequence.RDS")
+
+gene_id <- "FBgn0025790"
+output_fasta_path <- "~/Documents/Github/HCRv3_probe_design_personal/input/Dmel_TBPH-exon-constitutive.fa"
+
+fasta_lines <- c(
+  paste(
+   ">", gene_id, 
+   pluck(pcnc_constitutive_list, gene_id) %>% pluck("gene_name"),  
+   "RNA isoform-consitutive sequence (N collapsed)" 
+  ),
+  pluck(pcnc_constitutive_list, gene_id) %>% pluck("constitutive_seq_Ncollapsed")
+)
+
+write_lines(fasta_lines, output_fasta_path)
+
+
+```
+
+
+```{r}
+pcnc_constitutive_list %>%
+  purrr::keep(~ .x$gene_name == "SCAR") %>%
+  future_map(plot_isoforms) %>%
+  wrap_plots()
+
+x <- pcnc_constitutive_list[["FBgn0001316"]]$constitutive_intervals
+
+bedtoolsr::bt.getfasta(
+  fi = "~/Documents/Data/GENOMEDIR/Dmel/Drosophila_melanogaster.BDGP6.28.dna.toplevel.fa",
+  bed = x,
+  bedOut = TRUE,
+  s = TRUE
+) %>% as_tibble() %>%
+  setNames(c("chrom", "start", "end", "width", "strand", "seq")) %>%
+  dplyr::arrange(if(z == "+") start else desc(start)) %>%
+  mutate(nchar_plus_N_cumsum = cumsum(width + 1)) 
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
